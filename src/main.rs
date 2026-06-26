@@ -45,30 +45,37 @@ fn load_history() -> Vec<HistoryEntry> {
             let remote  = parts.next()?.to_string();
             let local   = parts.next()?.to_string();
             let options = parts.next().unwrap_or("").to_string();
-            if remote.is_empty() && local.is_empty() { return None; }
+            // FIX: || not && — reject entries where either required field is empty
+            if remote.is_empty() || local.is_empty() { return None; }
             Some(HistoryEntry { remote, local, options })
         })
         .collect()
 }
 
-fn save_history(history: &[HistoryEntry]) {
+fn save_history(history: &[HistoryEntry]) -> Result<(), std::io::Error> {
     let path = history_path();
     if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).ok();
+        std::fs::create_dir_all(dir)?;  // FIX: propagate instead of .ok()
     }
     let content = history
         .iter()
-        .map(|e| format!("{}\t{}\t{}", e.remote, e.local, e.options))
+        .map(|e| {
+            // FIX: strip control chars that would corrupt the tab-delimited format
+            let r = e.remote.replace(['\t', '\n', '\r'], "");
+            let l = e.local.replace(['\t', '\n', '\r'], "");
+            let o = e.options.replace(['\t', '\n', '\r'], "");
+            format!("{}\t{}\t{}", r, l, o)
+        })
         .collect::<Vec<_>>()
         .join("\n");
-    std::fs::write(path, content).ok();
+    std::fs::write(path, content)  // FIX: propagate instead of .ok()
 }
 
-fn push_history(history: &mut Vec<HistoryEntry>, entry: HistoryEntry) {
+fn push_history(history: &mut Vec<HistoryEntry>, entry: HistoryEntry) -> Result<(), std::io::Error> {
     history.retain(|e| e.remote != entry.remote || e.local != entry.local);
     history.insert(0, entry);
     history.truncate(MAX_HISTORY);
-    save_history(history);
+    save_history(history)
 }
 
 fn rebuild_combo(combo: &ComboBoxText, history: &[HistoryEntry]) {
@@ -87,12 +94,54 @@ fn rebuild_combo(combo: &ComboBoxText, history: &[HistoryEntry]) {
 
 // ── backend ───────────────────────────────────────────────────────────────────
 
-fn is_mounted(mount_point: &str) -> bool {
+// /proc/mounts encodes spaces and special chars as \NNN octal sequences.
+fn decode_proc_path(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    loop {
+        match chars.next() {
+            None => break,
+            Some('\\') => {
+                let d1 = chars.next();
+                let d2 = chars.next();
+                let d3 = chars.next();
+                match (d1, d2, d3) {
+                    (Some(a), Some(b), Some(c))
+                        if matches!(a, '0'..='7')
+                            && matches!(b, '0'..='7')
+                            && matches!(c, '0'..='7') =>
+                    {
+                        let n = (a as u32 - '0' as u32) * 64
+                            + (b as u32 - '0' as u32) * 8
+                            + (c as u32 - '0' as u32);
+                        if let Some(ch) = char::from_u32(n) {
+                            out.push(ch);
+                        }
+                    }
+                    _ => {
+                        out.push('\\');
+                        if let Some(a) = d1 { out.push(a); }
+                        if let Some(b) = d2 { out.push(b); }
+                        if let Some(c) = d3 { out.push(c); }
+                    }
+                }
+            }
+            Some(c) => out.push(c),
+        }
+    }
+    out
+}
+
+// FIX: returns Option<bool> — None when /proc/mounts is unreadable (container/sandbox)
+fn is_mounted(mount_point: &str) -> Option<bool> {
     let mp = mount_point.trim_end_matches('/');
-    std::fs::read_to_string("/proc/mounts")
-        .unwrap_or_default()
-        .lines()
-        .any(|line| line.split_whitespace().nth(1).map(|p| p.trim_end_matches('/')) == Some(mp))
+    // FIX: decode \NNN octal escapes so paths with spaces compare correctly
+    let content = std::fs::read_to_string("/proc/mounts").ok()?;
+    Some(content.lines().any(|line| {
+        let Some(raw) = line.split_whitespace().nth(1) else { return false };
+        let decoded = decode_proc_path(raw);
+        decoded.trim_end_matches('/') == mp
+    }))
 }
 
 fn do_mount(remote: String, local: String, options: String) -> Result<(), String> {
@@ -111,7 +160,8 @@ fn do_umount(local: String) -> Result<(), String> {
 }
 
 fn run_privileged(args: Vec<String>) -> Result<(), String> {
-    let out = std::process::Command::new("pkexec")
+    // FIX: absolute path avoids PATH hijacking and polkit action mismatch
+    let out = std::process::Command::new("/usr/bin/pkexec")
         .args(&args)
         .output()
         .map_err(|e| format!("Failed to launch pkexec: {e}"))?;
@@ -134,10 +184,13 @@ fn refresh_status(local_entry: &Entry, status_label: &Label) {
     let mp = text.trim();
     if mp.is_empty() {
         status_label.set_markup("<span color='gray'>● enter a mount point above</span>");
-    } else if is_mounted(mp) {
-        status_label.set_markup("<span color='#2ec27e' weight='bold'>● Mounted</span>");
     } else {
-        status_label.set_markup("<span color='#e01b24'>● Not mounted</span>");
+        // FIX: handle None (unreadable /proc/mounts) as a distinct "unknown" state
+        match is_mounted(mp) {
+            Some(true)  => status_label.set_markup("<span color='#2ec27e' weight='bold'>● Mounted</span>"),
+            Some(false) => status_label.set_markup("<span color='#e01b24'>● Not mounted</span>"),
+            None        => status_label.set_markup("<span color='gray'>● status unknown</span>"),
+        }
     }
 }
 
@@ -284,16 +337,18 @@ fn build_ui(app: &Application) {
         #[weak] recent_combo,
         #[strong] history,
         move |_| {
-            let remote = remote_entry.text().to_string();
-            let local  = local_entry.text().to_string();
-            let opts   = options_entry.text().to_string();
+            // FIX: trim early so push_history stores clean values (dedup works correctly)
+            let remote = remote_entry.text().trim().to_string();
+            let local  = local_entry.text().trim().to_string();
+            let opts   = options_entry.text().trim().to_string();
 
-            if remote.trim().is_empty() || local.trim().is_empty() {
+            if remote.is_empty() || local.is_empty() {
                 info_label.set_text("Remote and mount point are required.");
                 return;
             }
 
             set_busy(true, &[&mount_btn, &umount_btn, &refresh_btn]);
+            recent_combo.set_sensitive(false);  // FIX: lock combo during async op
             info_label.set_text("Mounting…");
 
             let (r2, l2, o2) = (remote.clone(), local.clone(), opts.clone());
@@ -309,13 +364,21 @@ fn build_ui(app: &Application) {
                     .unwrap_or_else(|_| Err("Thread panicked".into()));
 
                 set_busy(false, &[&mount_btn, &umount_btn, &refresh_btn]);
+                recent_combo.set_sensitive(true);  // FIX: restore combo
                 match result {
                     Ok(()) => {
-                        info_label.set_text("");
                         refresh_status(&local_entry, &status_label);
-                        push_history(&mut history.borrow_mut(), HistoryEntry {
+                        // FIX: surface history-save errors rather than silently dropping them
+                        if let Err(e) = push_history(&mut history.borrow_mut(), HistoryEntry {
                             remote: r2, local: l2, options: o2,
-                        });
+                        }) {
+                            info_label.set_markup(&format!(
+                                "<span color='#e01b24'>Mounted, but failed to save history: {}</span>",
+                                escape_markup(&e.to_string())
+                            ));
+                        } else {
+                            info_label.set_text("");
+                        }
                         rebuild_combo(&recent_combo, &history.borrow());
                     }
                     Err(e) => info_label.set_markup(&format!(
@@ -331,21 +394,24 @@ fn build_ui(app: &Application) {
         #[weak] local_entry,
         #[weak] status_label, #[weak] info_label,
         #[weak] mount_btn, #[weak] umount_btn, #[weak] refresh_btn,
+        #[weak] recent_combo,  // FIX: capture so it can be locked during async op
         move |_| {
-            let local = local_entry.text().to_string();
+            let local = local_entry.text().trim().to_string();
 
-            if local.trim().is_empty() {
+            if local.is_empty() {
                 info_label.set_text("Mount point is required.");
                 return;
             }
 
             set_busy(true, &[&mount_btn, &umount_btn, &refresh_btn]);
+            recent_combo.set_sensitive(false);  // FIX: lock combo during async op
             info_label.set_text("Unmounting…");
 
             let (local_entry, status_label, info_label) =
                 (local_entry.clone(), status_label.clone(), info_label.clone());
             let (mount_btn, umount_btn, refresh_btn) =
                 (mount_btn.clone(), umount_btn.clone(), refresh_btn.clone());
+            let recent_combo = recent_combo.clone();
 
             glib::spawn_future_local(async move {
                 let result = gio::spawn_blocking(move || do_umount(local))
@@ -353,6 +419,7 @@ fn build_ui(app: &Application) {
                     .unwrap_or_else(|_| Err("Thread panicked".into()));
 
                 set_busy(false, &[&mount_btn, &umount_btn, &refresh_btn]);
+                recent_combo.set_sensitive(true);  // FIX: restore combo
                 match result {
                     Ok(()) => {
                         info_label.set_text("");
