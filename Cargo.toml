@@ -1,0 +1,8 @@
+[package]
+name = "nfs-mount"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+gtk4 = "0.9"
+libadwaita = { version = "0.7", features = ["v1_6"] }
